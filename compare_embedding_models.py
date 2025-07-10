@@ -10,7 +10,7 @@ Features:
   - Embed documents and queries with each model
   - Build & save separate FAISS indices for each model
   - (Optional) Upsert each document + vectors into MongoDB
-  - Perform a sample k-NN query, display results side-by-side in a rich table
+  - Perform a sample k-NN query, display separate rich tables per model
   - Recommend the model with the highest average top-k similarity
 
 Requirements:
@@ -35,7 +35,11 @@ OLLAMA_API      = "http://localhost:11434/api/embeddings"
 MODELS          = [
     "nomic-embed-text",
     "snowflake-arctic-embed:22m",
-    "qwen3:0.6b",
+    "granite-embedding:30m",
+    "all-minilm:22m",
+    "all-minilm:33m",
+    "snowflake-arctic-embed:33m",
+    "snowflake-arctic-embed",
 ]
 FAISS_INDEX_FNS = {model: f"vector_index_{model.replace(':','_')}.faiss" for model in MODELS}
 ID_MAP_FNS      = {model: f"id_map_{model.replace(':','_')}.pkl" for model in MODELS}
@@ -85,9 +89,9 @@ def build_or_load_index(model: str, docs: list[dict]):
         index = faiss.IndexFlatIP(dim)
         index.add(vecs)
         faiss.write_index(index, idx_file)
-        with open(id_file, 'wb') as f:
-            pickle.dump([str(d.get('id', i)) for i, d in enumerate(docs)], f)
         ids = [str(d.get('id', i)) for i, d in enumerate(docs)]
+        with open(id_file, 'wb') as f:
+            pickle.dump(ids, f)
         console.log(f"Saved index for [bold]{model}[/] to disk.")
     return index, ids
 
@@ -122,37 +126,38 @@ def main():
 
     # Sample query
     query = {"action": "purchase", "user": "alice"}
-    # query = "Hi"
     q_text = json.dumps(query)
 
-    # Prepare rich table
-    table = Table(title="Model Comparison Results")
-    table.add_column("Rank", justify="right")
-    for model in MODELS:
-        table.add_column(f"ID ({model})", justify="center")
-        table.add_column(f"Score ({model})", justify="right")
-
-    # Query and collect scores
-    avg_top_scores = {}
+    # Execute and display separate tables per model
     k = 3
     for model in MODELS:
+        console.rule(f"Results for [bold]{model}[/]")
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Rank", justify="right")
+        table.add_column("ID", justify="center")
+        table.add_column("Score", justify="right")
+
         q_emb = normalize(get_embedding(q_text, model).reshape(1, -1))
         D, I = indices[model].search(q_emb, k)
-        avg_top_scores[model] = float(D.mean())
+
         for rank in range(k):
-            if model == MODELS[0]:
-                row = [str(rank+1)]
             idx = I[0][rank]
             score = D[0][rank]
-            row.extend([id_maps[model][idx], f"{score:.4f}"])
-        if model == MODELS[-1]:
-            table.add_row(*row)
+            table.add_row(str(rank+1), id_maps[model][idx], f"{score:.4f}")
 
-    console.print(table)
+        console.print(table)
+        avg_score = float(D.mean())
+        console.print(f"Average top-{k} score for [bold]{model}[/]: {avg_score:.4f}\n")
 
     # Recommend best model
-    best = max(avg_top_scores, key=avg_top_scores.get)
-    console.print(f":star: [bold green]Recommended model:[/] {best} (avg top-{k} score = {avg_top_scores[best]:.4f})")
+    # Compute averages again
+    avg_scores = {}
+    for model in MODELS:
+        q_emb = normalize(get_embedding(q_text, model).reshape(1, -1))
+        D, _ = indices[model].search(q_emb, k)
+        avg_scores[model] = float(D.mean())
+    best = max(avg_scores, key=avg_scores.get)
+    console.print(f":star: [bold green]Recommended model:[/] {best} (avg top-{k} score = {avg_scores[best]:.4f})")
 
 if __name__ == "__main__":
     main()
