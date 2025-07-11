@@ -3,15 +3,16 @@
 vector_search_rich.py
 
 Enhanced FAISS + MongoDB vector search over JSONL payloads
-with JSON output for displaying documents and query results.
+with Rich panels for displaying both initial docs and each search result as boxed JSON.
 
 Features:
   - Load or build FAISS index & ID map
   - Optional MongoDB upsert
-  - Display documents and search results as pretty-printed JSON
+  - Display loaded documents as pretty JSON
+  - Display each k-NN result in its own Rich Panel with formatted JSON
 
 Requirements:
-    pip install faiss-cpu numpy requests pymongo
+    pip install faiss-cpu numpy requests pymongo rich
 """
 
 import os
@@ -21,8 +22,10 @@ import requests
 import numpy as np
 import faiss
 from pymongo import MongoClient
+from rich.console import Console
+from rich.panel import Panel
 
-# 1. CONFIGURATION
+# Configuration
 JSONL_FILE     = "data.jsonl"
 OLLAMA_API     = "http://localhost:11434/api/embeddings"
 OLLAMA_MODEL   = "nomic-embed-text"
@@ -33,98 +36,89 @@ MONGO_URI      = "mongodb://localhost:27017"
 MONGO_DB       = "vector_search_db"
 MONGO_COLL     = "docs"
 
+console = Console()
 
 def get_embedding(text: str) -> np.ndarray:
-    resp = requests.post(
-        OLLAMA_API,
-        json={"model": OLLAMA_MODEL, "prompt": text},
-    )
+    resp = requests.post(OLLAMA_API, json={"model": OLLAMA_MODEL, "prompt": text})
     resp.raise_for_status()
     return np.array(resp.json().get("embedding"), dtype=np.float32)
 
-
 def normalize(vects: np.ndarray):
     faiss.normalize_L2(vects)
-
 
 def load_jsonl(path: str) -> list[dict]:
     docs = []
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.strip():
-                docs.append(json.loads(line))
+            if line.strip(): docs.append(json.loads(line))
     return docs
 
-
 def print_json(data):
-    """Pretty-print JSON data to stdout."""
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-
+    """Returns a pretty-printed JSON string."""
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 def main():
+    # MongoDB connection
     if USE_MONGO:
         mongo = MongoClient(MONGO_URI)
-        coll  = mongo[MONGO_DB][MONGO_COLL]
+        coll = mongo[MONGO_DB][MONGO_COLL]
 
+    # Load or build index
     if os.path.exists(FAISS_INDEX_FN) and os.path.exists(ID_MAP_FN):
-        print("Loading existing FAISS index and ID map...")
+        console.print("[green]Loaded existing FAISS index & ID map[/]")
         index = faiss.read_index(FAISS_INDEX_FN)
-        with open(ID_MAP_FN, 'rb') as f:
-            ids = pickle.load(f)
+        with open(ID_MAP_FN, 'rb') as f: ids = pickle.load(f)
     else:
-        print("Building new FAISS index from JSONL file...")
+        console.print("[yellow]Building FAISS index from JSONL...[/]")
         docs = load_jsonl(JSONL_FILE)
         if not docs:
-            raise ValueError(f"No documents found in {JSONL_FILE}")
+            console.print(f"[bold red]No documents in {JSONL_FILE}[/]")
+            return
 
-        print_json(docs)
+        # Show loaded docs JSON
+        console.print(Panel(print_json(docs), title="Loaded Documents", expand=False))
+
         texts = [json.dumps(d, ensure_ascii=False) for d in docs]
-        vecs  = np.vstack([get_embedding(t) for t in texts])
-        ids   = [str(d.get('id', idx)) for idx, d in enumerate(docs)]
+        vecs = np.vstack([get_embedding(t) for t in texts])
+        ids = [str(d.get('id', idx)) for idx, d in enumerate(docs)]
 
         normalize(vecs)
-        dim   = vecs.shape[1]
+        dim = vecs.shape[1]
         index = faiss.IndexFlatIP(dim)
         index.add(vecs)
 
+        # Save index & IDs
         faiss.write_index(index, FAISS_INDEX_FN)
-        with open(ID_MAP_FN, 'wb') as f:
-            pickle.dump(ids, f)
-        print(f"Saved FAISS index and ID map.")
+        with open(ID_MAP_FN, 'wb') as f: pickle.dump(ids, f)
+        console.print("[green]Saved FAISS index & ID map[/]")
 
         if USE_MONGO:
-            print("Upserting documents into MongoDB...")
+            console.print("[blue]Upserting docs into MongoDB...[/]")
             for d, vec in zip(docs, vecs):
-                coll.replace_one(
-                    {"_id": str(d.get('id', None))},
-                    {**d, "vector": vec.tolist()},
-                    upsert=True
-                )
-            print(f"Upserted {len(docs)} documents.")
+                coll.replace_one({"_id": str(d.get('id', None))}, {**d, "vector": vec.tolist()}, upsert=True)
+            console.print(f"[blue]Upserted {len(docs)} docs[/]")
 
-    # Prepare and embed sample query
+    # Prepare & embed query
     query = "Nginx Workload"
     q_emb = get_embedding(json.dumps(query)).reshape(1, -1).astype(np.float32)
     normalize(q_emb)
 
     # k-NN search
     k = 3
-    print(f"\nQuerying FAISS for top {k} results for: {query}\n")
+    console.print(f"\n[bold]Top {k} results for query:[/] [cyan]{query}[/]\n")
     distances, indices = index.search(q_emb, k)
 
-    results = []
+    # Display each result in a Panel
     for rank, (idx, score) in enumerate(zip(indices[0], distances[0]), start=1):
-        # Ensure score is JSON serializable
         score_val = float(score)
         doc_id = ids[idx]
         entry = {"rank": rank, "id": doc_id, "score": score_val}
         if USE_MONGO:
             doc = coll.find_one({"_id": doc_id}, {"vector": 0}) or {}
-            # All doc values should already be JSON serializable
             entry.update(doc)
-        results.append(entry)
 
-    print_json(results)
+        panel_title = f"Result {rank} (score: {score_val:.4f})"
+        console.print(Panel(print_json(entry), title=panel_title, expand=False))
 
 if __name__ == "__main__":
     main()
