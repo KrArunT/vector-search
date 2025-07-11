@@ -1,0 +1,13 @@
+[project]
+name = "vdb-search"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "faiss-cpu>=1.11.0",
+    "numpy>=2.3.1",
+    "pymongo>=4.13.2",
+    "requests>=2.32.4",
+    "rich>=14.0.0",
+]
