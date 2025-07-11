@@ -3,13 +3,13 @@
 vector_search_rich.py
 
 Enhanced FAISS + MongoDB vector search over JSONL payloads
-with Rich panels for displaying both initial docs and each search result as boxed JSON.
+with Rich panels and colored JSON syntax for both initial docs and search results.
 
 Features:
   - Load or build FAISS index & ID map
   - Optional MongoDB upsert
-  - Display loaded documents as pretty JSON
-  - Display each k-NN result in its own Rich Panel with formatted JSON
+  - Display loaded documents as colored JSON
+  - Display each k-NN result in its own Rich Panel with colored JSON
 
 Requirements:
     pip install faiss-cpu numpy requests pymongo rich
@@ -24,6 +24,7 @@ import faiss
 from pymongo import MongoClient
 from rich.console import Console
 from rich.panel import Panel
+from rich.json import JSON
 
 # Configuration
 JSONL_FILE     = "data.jsonl"
@@ -53,21 +54,23 @@ def load_jsonl(path: str) -> list[dict]:
             if line.strip(): docs.append(json.loads(line))
     return docs
 
-def print_json(data):
-    """Returns a pretty-printed JSON string."""
-    return json.dumps(data, ensure_ascii=False, indent=2)
-
 def main():
     # MongoDB connection
     if USE_MONGO:
         mongo = MongoClient(MONGO_URI)
         coll = mongo[MONGO_DB][MONGO_COLL]
 
+    # Prepare & embed query
+    query = "Nginx Workload"
+    q_emb = get_embedding(json.dumps(query)).reshape(1, -1).astype(np.float32)
+    normalize(q_emb)
+
     # Load or build index
     if os.path.exists(FAISS_INDEX_FN) and os.path.exists(ID_MAP_FN):
         console.print("[green]Loaded existing FAISS index & ID map[/]")
         index = faiss.read_index(FAISS_INDEX_FN)
-        with open(ID_MAP_FN, 'rb') as f: ids = pickle.load(f)
+        with open(ID_MAP_FN, 'rb') as f:
+            ids = pickle.load(f)
     else:
         console.print("[yellow]Building FAISS index from JSONL...[/]")
         docs = load_jsonl(JSONL_FILE)
@@ -75,8 +78,8 @@ def main():
             console.print(f"[bold red]No documents in {JSONL_FILE}[/]")
             return
 
-        # Show loaded docs JSON
-        console.print(Panel(print_json(docs), title="Loaded Documents", expand=False))
+        # Display loaded docs with colored JSON
+        console.print(Panel(JSON.from_data(docs), title="Loaded Documents", expand=False))
 
         texts = [json.dumps(d, ensure_ascii=False) for d in docs]
         vecs = np.vstack([get_embedding(t) for t in texts])
@@ -89,7 +92,8 @@ def main():
 
         # Save index & IDs
         faiss.write_index(index, FAISS_INDEX_FN)
-        with open(ID_MAP_FN, 'wb') as f: pickle.dump(ids, f)
+        with open(ID_MAP_FN, 'wb') as f:
+            pickle.dump(ids, f)
         console.print("[green]Saved FAISS index & ID map[/]")
 
         if USE_MONGO:
@@ -98,17 +102,12 @@ def main():
                 coll.replace_one({"_id": str(d.get('id', None))}, {**d, "vector": vec.tolist()}, upsert=True)
             console.print(f"[blue]Upserted {len(docs)} docs[/]")
 
-    # Prepare & embed query
-    query = "Nginx Workload"
-    q_emb = get_embedding(json.dumps(query)).reshape(1, -1).astype(np.float32)
-    normalize(q_emb)
-
     # k-NN search
     k = 3
     console.print(f"\n[bold]Top {k} results for query:[/] [cyan]{query}[/]\n")
     distances, indices = index.search(q_emb, k)
 
-    # Display each result in a Panel
+    # Display each result in a Panel with colored JSON
     for rank, (idx, score) in enumerate(zip(indices[0], distances[0]), start=1):
         score_val = float(score)
         doc_id = ids[idx]
@@ -118,7 +117,7 @@ def main():
             entry.update(doc)
 
         panel_title = f"Result {rank} (score: {score_val:.4f})"
-        console.print(Panel(print_json(entry), title=panel_title, expand=False))
+        console.print(Panel(JSON.from_data(entry), title=panel_title, expand=False))
 
 if __name__ == "__main__":
     main()
