@@ -1,0 +1,3 @@
+{"id": "1", "user": "alice",   "action": "login",    "time": "2025-07-09T10:15:00Z"}
+{"id": "2", "user": "bob",     "action": "purchase", "item": "widget", "amount": 25.0}
+{"id": "3", "user": "charlie", "action": "logout",   "time": "2025-07-09T11:45:00Z"}
