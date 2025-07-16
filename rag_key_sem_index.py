@@ -139,10 +139,9 @@ def insert_into_mongo(chunks: List[Dict[str, Any]], embs: np.ndarray) -> List[st
         client.close()
     return ids
 
-# 6a. Semantic search
+# 6a. Semantic search with scores and source docs
 
 def semantic_search(query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
-    # ensure index exists
     if not (os.path.exists(INDEX_PATH) and os.path.exists(REFS_PATH)):
         console.print("[red]Index not found. Please ingest first.[/]")
         return []
@@ -150,22 +149,25 @@ def semantic_search(query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     if q_emb.ndim != 2 or q_emb.size == 0:
         return []
     idx = faiss.read_index(INDEX_PATH)
-    D, I = idx.search(q_emb, k)
+    distances, indices = idx.search(q_emb, k)
     refs = json.load(open(REFS_PATH))
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
     results = []
-    for pos in I[0]:
+    for dist, pos in zip(distances[0], indices[0]):
         doc = col.find_one({'_id': ObjectId(refs[pos])})
         if doc:
-            results.append(doc)
+            results.append({
+                'source': doc['source'],
+                'chunk': doc['chunk'],
+                'score': float(dist)
+            })
     client.close()
     return results
 
-# 6b. Keyword search
+# 6b. Keyword search (unchanged)
 
 def keyword_search(term: str, k: int = TOP_K) -> List[Dict[str, Any]]:
-    # ensure index exists
     if not (os.path.exists(INDEX_PATH) and os.path.exists(REFS_PATH)):
         console.print("[red]Index not found. Please ingest first.[/]")
         return []
@@ -178,7 +180,6 @@ def keyword_search(term: str, k: int = TOP_K) -> List[Dict[str, Any]]:
 # 7. LLM chat
 
 def chat_with_llm(question: str, contexts: List[str]) -> str:
-    # do not trigger any re-indexing here
     prompt = "Use the following documents to answer the question:\n"
     for i, c in enumerate(contexts):
         prompt += f"[Doc {i+1}]: {c}\n"
@@ -213,11 +214,13 @@ def main():
             console.print("[green]Ingest complete![/]")
         elif opt == 3:
             q = Prompt.ask("Query")
+            results = semantic_search(q)
             tbl = Table(title="Semantic Results", box=box.SIMPLE)
             tbl.add_column("Src")
+            tbl.add_column("Score")
             tbl.add_column("Chunk")
-            for d in semantic_search(q):
-                tbl.add_row(str(d['source']), d['chunk'])
+            for r in results:
+                tbl.add_row(str(r['source']), f"{r['score']:.4f}", r['chunk'])
             console.print(tbl)
         elif opt == 4:
             t = Prompt.ask("Term")
