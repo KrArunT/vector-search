@@ -12,6 +12,7 @@ from rich.table import Table
 from rich.prompt import Prompt, IntPrompt
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.tree import Tree
 from rich import box
 import random
 import string
@@ -22,7 +23,7 @@ MONGO_URI = "mongodb://localhost:27017"
 DB_NAME = "rag_db"
 COLLECTION_NAME = "documents"
 EMBED_MODEL = "snowflake-arctic-embed:22m"
-LLM_MODEL = "qwen3:0.6b"
+LLM_MODEL = "qwen3:0.6"
 INDEX_PATH = "faiss.index"
 REFS_PATH = "index_refs.json"
 CHUNK_SIZE = 500  # characters
@@ -56,7 +57,7 @@ def flatten_json(obj: Any, prefix: str = '') -> Dict[str, Any]:
         items[prefix] = obj
     return items
 
-# 2. Load & chunk docs
+# 2. Load & chunk docs (includes raw)
 
 def load_and_chunk(path: str) -> List[Dict[str, Any]]:
     with open(path, 'r', encoding='utf-8') as f:
@@ -68,12 +69,16 @@ def load_and_chunk(path: str) -> List[Dict[str, Any]]:
     ) as progress:
         task = progress.add_task("Chunking data", total=len(lines))
         for line in lines:
-            data = json.loads(line)
-            flat = flatten_json(data)
+            raw = json.loads(line)
+            flat = flatten_json(raw)
             text = json.dumps(flat, ensure_ascii=False)
             for i in range(0, len(text), CHUNK_STRIDE):
                 seg = text[i:i + CHUNK_SIZE]
-                chunks.append({'chunk': seg, 'source': flat.get('id') or flat.get('source')})
+                chunks.append({
+                    'chunk': seg,
+                    'source': raw.get('id') or raw.get('source'),
+                    'raw': raw
+                })
                 if i + CHUNK_SIZE >= len(text):
                     break
             progress.advance(task)
@@ -95,22 +100,18 @@ def embed_texts(texts: List[str]) -> np.ndarray:
                 if not vec:
                     console.print(f"[red]Empty embedding for segment[/]")
                 else:
-                    if isinstance(vec[0], list):
-                        vec = vec[0]
+                    if isinstance(vec[0], list): vec = vec[0]
                     embs.append(vec)
             except Exception as e:
                 console.print(f"[red]Embed error:[/] {e}")
             progress.advance(task)
-    if not embs:
-        return np.empty((0,0), dtype='float32')
-    arr = np.array(embs, dtype='float32')
-    if arr.ndim > 2:
-        arr = arr.reshape(arr.shape[0], -1)
+    arr = np.array(embs, dtype='float32') if embs else np.empty((0,0), dtype='float32')
+    if arr.ndim > 2: arr = arr.reshape(arr.shape[0], -1)
     return arr
 
 # 4. Build FAISS index + save refs
 
-def build_index(embs: np.ndarray, refs: List[str]) -> faiss.IndexFlatL2:
+def build_index(embs: np.ndarray, refs: List[str]) -> None:
     if embs.ndim != 2 or embs.size == 0:
         raise ValueError("Embeddings must be 2D non-empty")
     dim = embs.shape[1]
@@ -122,7 +123,6 @@ def build_index(embs: np.ndarray, refs: List[str]) -> faiss.IndexFlatL2:
     faiss.write_index(idx, INDEX_PATH)
     with open(REFS_PATH, 'w') as f:
         json.dump(refs, f)
-    return idx
 
 # 5. Insert into MongoDB
 
@@ -133,13 +133,19 @@ def insert_into_mongo(chunks: List[Dict[str, Any]], embs: np.ndarray) -> List[st
         client = MongoClient(MONGO_URI)
         col = client[DB_NAME][COLLECTION_NAME]
         for ch, vec in zip(chunks, embs):
-            res = col.insert_one({'chunk': ch['chunk'], 'source': ch['source'], 'embedding': vec.tolist()})
+            record = {
+                'chunk': ch['chunk'],
+                'source': ch['source'],
+                'raw': ch['raw'],
+                'embedding': vec.tolist()
+            }
+            res = col.insert_one(record)
             ids.append(str(res.inserted_id))
             p.advance(task)
         client.close()
     return ids
 
-# 6a. Semantic search with scores and source docs
+# 6a. Semantic search with scores and raw
 
 def semantic_search(query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     if not (os.path.exists(INDEX_PATH) and os.path.exists(REFS_PATH)):
@@ -157,15 +163,11 @@ def semantic_search(query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     for dist, pos in zip(distances[0], indices[0]):
         doc = col.find_one({'_id': ObjectId(refs[pos])})
         if doc:
-            results.append({
-                'source': doc['source'],
-                'chunk': doc['chunk'],
-                'score': float(dist)
-            })
+            results.append({'source': doc['source'], 'chunk': doc['chunk'], 'raw': doc['raw'], 'score': float(dist)})
     client.close()
     return results
 
-# 6b. Keyword search (unchanged)
+# 6b. Keyword search with raw
 
 def keyword_search(term: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     if not (os.path.exists(INDEX_PATH) and os.path.exists(REFS_PATH)):
@@ -173,16 +175,15 @@ def keyword_search(term: str, k: int = TOP_K) -> List[Dict[str, Any]]:
         return []
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
-    results = list(col.find({'chunk': {'$regex': term, '$options': 'i'}}).limit(k))
+    docs = list(col.find({'chunk': {'$regex': term, '$options': 'i'}}).limit(k))
     client.close()
-    return results
+    return [{'source': d['source'], 'chunk': d['chunk'], 'raw': d['raw']} for d in docs]
 
 # 7. LLM chat
 
 def chat_with_llm(question: str, contexts: List[str]) -> str:
     prompt = "Use the following documents to answer the question:\n"
-    for i, c in enumerate(contexts):
-        prompt += f"[Doc {i+1}]: {c}\n"
+    for i, c in enumerate(contexts): prompt += f"[Doc {i+1}]: {c}\n"
     prompt += f"\nQuestion: {question}"
     try:
         out = ollama.generate(model=LLM_MODEL, prompt=prompt)
@@ -215,21 +216,19 @@ def main():
         elif opt == 3:
             q = Prompt.ask("Query")
             results = semantic_search(q)
-            tbl = Table(title="Semantic Results", box=box.SIMPLE)
-            tbl.add_column("Src")
-            tbl.add_column("Score")
-            tbl.add_column("Chunk")
             for r in results:
-                tbl.add_row(str(r['source']), f"{r['score']:.4f}", r['chunk'])
-            console.print(tbl)
+                tree = Tree(f"[bold]{r['source']}[/] (score: {r['score']:.4f})")
+                tree.add(f"[italic]Chunk:[/] {r['chunk']}")
+                tree.add(f"[italic]Raw:[/] {json.dumps(r['raw'], indent=2)}")
+                console.print(tree)
         elif opt == 4:
             t = Prompt.ask("Term")
-            tbl = Table(title="Keyword Results", box=box.SIMPLE)
-            tbl.add_column("Src")
-            tbl.add_column("Chunk")
-            for d in keyword_search(t):
-                tbl.add_row(str(d['source']), d['chunk'])
-            console.print(tbl)
+            docs = keyword_search(t)
+            for d in docs:
+                tree = Tree(f"[bold]{d['source']}[/]")
+                tree.add(f"[italic]Chunk:[/] {d['chunk']}")
+                tree.add(f"[italic]Raw:[/] {json.dumps(d['raw'], indent=2)}")
+                console.print(tree)
         elif opt == 5:
             q = Prompt.ask("Question")
             ctxs = [d['chunk'] for d in semantic_search(q)]
